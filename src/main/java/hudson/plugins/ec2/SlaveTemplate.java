@@ -15,7 +15,10 @@ import hudson.util.ListBoxModel;
 
 import java.io.IOException;
 import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Set;
@@ -28,10 +31,16 @@ import org.kohsuke.stapler.QueryParameter;
 
 import com.amazonaws.AmazonClientException;
 import com.amazonaws.services.ec2.AmazonEC2;
+import com.amazonaws.services.ec2.model.BlockDeviceMapping;
+import com.amazonaws.services.ec2.model.CreateVolumeRequest;
+import com.amazonaws.services.ec2.model.CreateVolumeResult;
 import com.amazonaws.services.ec2.model.DescribeImagesRequest;
 import com.amazonaws.services.ec2.model.DescribeInstancesRequest;
+import com.amazonaws.services.ec2.model.EbsBlockDevice;
+import com.amazonaws.services.ec2.model.EbsInstanceBlockDevice;
 import com.amazonaws.services.ec2.model.Image;
 import com.amazonaws.services.ec2.model.Instance;
+import com.amazonaws.services.ec2.model.InstanceBlockDeviceMapping;
 import com.amazonaws.services.ec2.model.InstanceType;
 import com.amazonaws.services.ec2.model.KeyPair;
 import com.amazonaws.services.ec2.model.Placement;
@@ -45,6 +54,7 @@ import com.amazonaws.services.ec2.model.RunInstancesRequest;
 public class SlaveTemplate implements Describable<SlaveTemplate> {
     public final String ami;
     public final String description;
+    public final String snapshotVolume;
     public final String zone;
     public final String remoteFS;
     public final String sshPort;
@@ -63,9 +73,10 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
     private transient /*almost final*/ Set<LabelAtom> labelSet;
 
     @DataBoundConstructor
-    public SlaveTemplate(String ami, String zone, String remoteFS, String sshPort, InstanceType type, String labelString, String description, String initScript, String userData, String numExecutors, String remoteAdmin, String rootCommandPrefix, String jvmopts, boolean stopOnTerminate) {
+    public SlaveTemplate(String ami, String zone, String remoteFS, String sshPort, InstanceType type, String labelString, String description, String initScript, String userData, String numExecutors, String remoteAdmin, String rootCommandPrefix, String jvmopts, boolean stopOnTerminate, String snapshotVolume) {
         this.ami = ami;
         this.zone = zone;
+        this.snapshotVolume = snapshotVolume;
         this.remoteFS = remoteFS;
         this.sshPort = sshPort;
         this.type = type;
@@ -156,8 +167,25 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
             request.setUserData(userData);
             request.setKeyName(keyPair.getKeyName());
             request.setInstanceType(type.toString());
+            
+            BlockDeviceMapping mapping = new BlockDeviceMapping();
+            EbsBlockDevice ebs = new EbsBlockDevice();
+            ebs.withDeleteOnTermination(true);
+            ebs.setSnapshotId(snapshotVolume);
+            ebs.setVolumeSize(30);
+            mapping.setEbs(ebs);
+            mapping.setDeviceName("/dev/sdh");
+            Set<BlockDeviceMapping> mappings = new HashSet<BlockDeviceMapping>();
+            mappings.add(mapping);
+            request.setBlockDeviceMappings(mappings);
+            
+            
             Instance inst = ec2.runInstances(request).getReservation().getInstances().get(0);
-            return newSlave(inst);
+            
+            
+			
+			
+			return newSlave(inst);
         } catch (FormException e) {
             throw new AssertionError(); // we should have discovered all configuration issues upfront
         }
@@ -225,7 +253,7 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
             AmazonEC2 ec2 = EC2Cloud.connect(accessId, secretKey, AmazonEC2Cloud.getEc2EndpointUrl(region));
             if(ec2!=null) {
                 try {
-                    List<String> images = new LinkedList<String>();
+                	List<String> images = new LinkedList<String>();
                     images.add(ami);
                     List<String> owners = new LinkedList<String>();
                     List<String> users = new LinkedList<String>();
