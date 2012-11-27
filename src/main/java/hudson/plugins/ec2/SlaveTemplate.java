@@ -15,36 +15,18 @@ import hudson.util.ListBoxModel;
 
 import java.io.IOException;
 import java.io.PrintStream;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 
 import javax.servlet.ServletException;
 
+import org.apache.commons.codec.binary.Base64;
 import org.apache.commons.lang.StringUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 
 import com.amazonaws.AmazonClientException;
 import com.amazonaws.services.ec2.AmazonEC2;
-import com.amazonaws.services.ec2.model.BlockDeviceMapping;
-import com.amazonaws.services.ec2.model.CreateVolumeRequest;
-import com.amazonaws.services.ec2.model.CreateVolumeResult;
-import com.amazonaws.services.ec2.model.DescribeImagesRequest;
-import com.amazonaws.services.ec2.model.DescribeInstancesRequest;
-import com.amazonaws.services.ec2.model.EbsBlockDevice;
-import com.amazonaws.services.ec2.model.EbsInstanceBlockDevice;
-import com.amazonaws.services.ec2.model.Image;
-import com.amazonaws.services.ec2.model.Instance;
-import com.amazonaws.services.ec2.model.InstanceBlockDeviceMapping;
-import com.amazonaws.services.ec2.model.InstanceType;
-import com.amazonaws.services.ec2.model.KeyPair;
-import com.amazonaws.services.ec2.model.Placement;
-import com.amazonaws.services.ec2.model.RunInstancesRequest;
+import com.amazonaws.services.ec2.model.*;
 
 /**
  * Template of {@link EC2Slave} to launch.
@@ -54,8 +36,8 @@ import com.amazonaws.services.ec2.model.RunInstancesRequest;
 public class SlaveTemplate implements Describable<SlaveTemplate> {
     public final String ami;
     public final String description;
-    public final String snapshotVolume;
     public final String zone;
+    public final String securityGroups;
     public final String remoteFS;
     public final String sshPort;
     public final InstanceType type;
@@ -66,17 +48,23 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
     public final String remoteAdmin;
     public final String rootCommandPrefix;
     public final String jvmopts;
+    public final String subnetId;
+    public final String idleTerminationMinutes;
+    public final int instanceCap;
     public final boolean stopOnTerminate;
+    private final List<EC2Tag> tags;
+    public final boolean usePrivateDnsName;
     protected transient EC2Cloud parent;
     
 
     private transient /*almost final*/ Set<LabelAtom> labelSet;
+	private transient /*almost final*/ Set<String> securityGroupSet;
 
     @DataBoundConstructor
-    public SlaveTemplate(String ami, String zone, String remoteFS, String sshPort, InstanceType type, String labelString, String description, String initScript, String userData, String numExecutors, String remoteAdmin, String rootCommandPrefix, String jvmopts, boolean stopOnTerminate, String snapshotVolume) {
+    public SlaveTemplate(String ami, String zone, String securityGroups, String remoteFS, String sshPort, InstanceType type, String labelString, String description, String initScript, String userData, String numExecutors, String remoteAdmin, String rootCommandPrefix, String jvmopts, boolean stopOnTerminate, String subnetId, List<EC2Tag> tags, String idleTerminationMinutes, boolean usePrivateDnsName, String instanceCapStr) {
         this.ami = ami;
         this.zone = zone;
-        this.snapshotVolume = snapshotVolume;
+        this.securityGroups = securityGroups;
         this.remoteFS = remoteFS;
         this.sshPort = sshPort;
         this.type = type;
@@ -89,6 +77,17 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
         this.rootCommandPrefix = rootCommandPrefix;
         this.jvmopts = jvmopts;
         this.stopOnTerminate = stopOnTerminate;
+        this.subnetId = subnetId;
+        this.tags = tags;
+        this.idleTerminationMinutes = idleTerminationMinutes;
+        this.usePrivateDnsName = usePrivateDnsName;
+
+        if (null == instanceCapStr || instanceCapStr.equals("")) {
+            this.instanceCap = Integer.MAX_VALUE;
+        } else {
+            this.instanceCap = Integer.parseInt(instanceCapStr);
+        }
+        
         readResolve(); // initialize
     }
     
@@ -108,6 +107,22 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
         return zone;
     }
 
+    public String getSecurityGroupString() {
+        return securityGroups;
+    }
+
+    public Set<String> getSecurityGroupSet() {
+        return securityGroupSet;
+    }
+
+    public Set<String> parseSecurityGroups() {
+        if (securityGroups == null || "".equals(securityGroups.trim())) {
+            return Collections.emptySet();
+        } else {
+            return new HashSet<String>(Arrays.asList(securityGroups.split("\\s*,\\s*")));
+        }
+    }
+
     public int getNumExecutors() {
         try {
             return Integer.parseInt(numExecutors);
@@ -123,6 +138,7 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
             return 22;
         }
     }
+
     public String getRemoteAdmin() {
         return remoteAdmin;
     }
@@ -130,11 +146,36 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
     public String getRootCommandPrefix() {
         return rootCommandPrefix;
     }
-    
-    public Set getLabelSet(){
-    	return labelSet;
+
+    public String getSubnetId() {
+        return subnetId;
+    }
+
+    public List<EC2Tag> getTags() {
+        if (null == tags) return null;
+        return Collections.unmodifiableList(tags);
+    }
+
+    public String getidleTerminationMinutes() {
+        return idleTerminationMinutes;
     }
     
+    public Set<LabelAtom> getLabelSet(){
+        return labelSet;
+    }
+
+    public int getInstanceCap() {
+        return instanceCap;
+    }
+
+    public String getInstanceCapStr() {
+        if (instanceCap==Integer.MAX_VALUE) {
+            return "";
+        } else {
+            return String.valueOf(instanceCap);
+        }
+    }
+
     /**
      * Does this contain the given label?
      *
@@ -157,42 +198,137 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
         try {
             logger.println("Launching "+ami);
             KeyPair keyPair = parent.getPrivateKey().find(ec2);
-            if(keyPair==null)
+            if(keyPair==null) {
                 throw new AmazonClientException("No matching keypair found on EC2. Is the EC2 private key a valid one?");
-            RunInstancesRequest request = new RunInstancesRequest(ami, 1, 1);
+            }
+           
+            RunInstancesRequest riRequest = new RunInstancesRequest(ami, 1, 1);
+
+            List<Filter> diFilters = new ArrayList<Filter>();
+            diFilters.add(new Filter("image-id").withValues(ami));
+            
             if (StringUtils.isNotBlank(getZone())) {
             	Placement placement = new Placement(getZone());
-            	request.setPlacement(placement);
+            	riRequest.setPlacement(placement);
+                diFilters.add(new Filter("availability-zone").withValues(getZone()));
             }
-            request.setUserData(userData);
-            request.setKeyName(keyPair.getKeyName());
-            request.setInstanceType(type.toString());
+
+            if (StringUtils.isNotBlank(getSubnetId())) {
+               riRequest.setSubnetId(getSubnetId());
+               diFilters.add(new Filter("subnet-id").withValues(getSubnetId()));
+
+               /* If we have a subnet ID then we can only use VPC security groups */
+               if (!securityGroupSet.isEmpty()) {
+                  List<String> group_ids = new ArrayList<String>();
+
+                  DescribeSecurityGroupsRequest group_req = new DescribeSecurityGroupsRequest();
+                  group_req.withFilters(new Filter("group-name").withValues(securityGroupSet));
+                  DescribeSecurityGroupsResult group_result = ec2.describeSecurityGroups(group_req);
+
+                  for (SecurityGroup group : group_result.getSecurityGroups()) {
+                     if (group.getVpcId() != null && !group.getVpcId().isEmpty()) {
+                        List<Filter> filters = new ArrayList<Filter>();
+                        filters.add(new Filter("vpc-id").withValues(group.getVpcId()));
+                        filters.add(new Filter("state").withValues("available"));
+                        filters.add(new Filter("subnet-id").withValues(getSubnetId()));
+
+                        DescribeSubnetsRequest subnet_req = new DescribeSubnetsRequest();
+                        subnet_req.withFilters(filters);
+                        DescribeSubnetsResult subnet_result = ec2.describeSubnets(subnet_req);
+
+                        List subnets = subnet_result.getSubnets();
+                        if(subnets != null && !subnets.isEmpty()) {
+                           group_ids.add(group.getGroupId());
+                        }
+                     }
+                  }
+
+                  if (securityGroupSet.size() != group_ids.size()) {
+                     throw new AmazonClientException( "Security groups must all be VPC security groups to work in a VPC context" );
+                  }
+
+                  if (!group_ids.isEmpty()) {
+                     riRequest.setSecurityGroupIds(group_ids);
+                     diFilters.add(new Filter("instance.group-id").withValues(group_ids));
+                  }
+               }
+            } else {
+               /* No subnet: we can use standard security groups by name */
+            	riRequest.setSecurityGroups(securityGroupSet);
+            	if (securityGroupSet.size() > 0)
+            		diFilters.add(new Filter("group-name").withValues(securityGroupSet));
+            }
+
+            String userDataString = Base64.encodeBase64String(userData.getBytes());
+            riRequest.setUserData(userDataString);
+            riRequest.setKeyName(keyPair.getKeyName());
+            diFilters.add(new Filter("key-name").withValues(keyPair.getKeyName()));
+            riRequest.setInstanceType(type.toString());
+            diFilters.add(new Filter("instance-type").withValues(type.toString()));
             
-            BlockDeviceMapping mapping = new BlockDeviceMapping();
-            EbsBlockDevice ebs = new EbsBlockDevice();
-            ebs.withDeleteOnTermination(true);
-            ebs.setSnapshotId(snapshotVolume);
-            ebs.setVolumeSize(30);
-            mapping.setEbs(ebs);
-            mapping.setDeviceName("/dev/sdh");
-            Set<BlockDeviceMapping> mappings = new HashSet<BlockDeviceMapping>();
-            mappings.add(mapping);
-            request.setBlockDeviceMappings(mappings);
+            HashSet<Tag> inst_tags = null;
+            if (tags != null && !tags.isEmpty()) {
+                inst_tags = new HashSet<Tag>();
+                for(EC2Tag t : tags) {
+                    diFilters.add(new Filter("tag:"+t.getName()).withValues(t.getValue()));
+                }
+            }
             
+            DescribeInstancesRequest diRequest = new DescribeInstancesRequest();
+            diFilters.add(new Filter("instance-state-name").withValues(InstanceStateName.Stopped.toString(), 
+            		InstanceStateName.Stopping.toString()));
+            diRequest.setFilters(diFilters);
+            logger.println("Looking for existing instances: "+diRequest);
+
+            DescribeInstancesResult diResult = ec2.describeInstances(diRequest);
+            if (diResult.getReservations().size() == 0) {
+                // Have to create a new instance
+                Instance inst = ec2.runInstances(riRequest).getReservation().getInstances().get(0);
+
+                /* Now that we have our instance, we can set tags on it */
+                if (inst_tags != null) {
+                    CreateTagsRequest tag_request = new CreateTagsRequest();
+                    tag_request.withResources(inst.getInstanceId()).setTags(inst_tags);
+                    ec2.createTags(tag_request);
+
+                    // That was a remote request - we should also update our local instance data.
+                    inst.setTags(inst_tags);
+                }
+                logger.println("No existing instance found - created: "+inst);
+                return newSlave(inst);
+            }
+            	
+            Instance inst = diResult.getReservations().get(0).getInstances().get(0);
+            logger.println("Found existing stopped instance: "+inst);
+            List<String> instances = new ArrayList<String>();
+            instances.add(inst.getInstanceId());
+            StartInstancesRequest siRequest = new StartInstancesRequest(instances);
+            StartInstancesResult siResult = ec2.startInstances(siRequest);
+            logger.println("Starting existing instance: "+inst+ " result:"+siResult);
+
+            List<Node> nodes = Hudson.getInstance().getNodes();
+            for (int i = 0, len = nodes.size(); i < len; i++) {
+            	if (!(nodes.get(i) instanceof EC2Slave))
+            		continue;
+            	EC2Slave ec2Node = (EC2Slave) nodes.get(i);
+            	if (ec2Node.getInstanceId().equals(inst.getInstanceId())) {
+                    logger.println("Found existing corresponding: "+ec2Node);
+            		return ec2Node;
+            	}
+            }
             
-            Instance inst = ec2.runInstances(request).getReservation().getInstances().get(0);
+            // Existing slave not found 
+            logger.println("Creating new slave for existing instance: "+inst);
+            return newSlave(inst);
             
-            
-			
-			
-			return newSlave(inst);
         } catch (FormException e) {
             throw new AssertionError(); // we should have discovered all configuration issues upfront
         }
     }
 
+
     private EC2Slave newSlave(Instance inst) throws FormException, IOException {
-        return new EC2Slave(inst.getInstanceId(), description, remoteFS, getSshPort(), getNumExecutors(), labels, initScript, remoteAdmin, rootCommandPrefix, jvmopts, stopOnTerminate);
+        return new EC2Slave(inst.getInstanceId(), description, remoteFS, getSshPort(), getNumExecutors(), labels, initScript, remoteAdmin, rootCommandPrefix, jvmopts, stopOnTerminate, idleTerminationMinutes, inst.getPublicDnsName(), inst.getPrivateDnsName(), EC2Tag.fromAmazonTags(inst.getTags()), usePrivateDnsName);
     }
 
     /**
@@ -219,6 +355,7 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
      */
     protected Object readResolve() {
         labelSet = Label.parse(labels);
+        securityGroupSet = parseSecurityGroups();
         return this;
     }
 
@@ -229,7 +366,7 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
     @Extension
     public static final class DescriptorImpl extends Descriptor<SlaveTemplate> {
         @Override
-		public String getDisplayName() {
+        public String getDisplayName() {
             return null;
         }
 
@@ -253,7 +390,7 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
             AmazonEC2 ec2 = EC2Cloud.connect(accessId, secretKey, AmazonEC2Cloud.getEc2EndpointUrl(region));
             if(ec2!=null) {
                 try {
-                	List<String> images = new LinkedList<String>();
+                    List<String> images = new LinkedList<String>();
                     images.add(ami);
                     List<String> owners = new LinkedList<String>();
                     List<String> users = new LinkedList<String>();
@@ -273,12 +410,33 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
             } else
                 return FormValidation.ok();   // can't test
         }
+
+        public FormValidation doCheckIdleTerminationMinutes(@QueryParameter String value) {
+            if (value == null || value.trim() == "") return FormValidation.ok();
+            try {
+                int val = Integer.parseInt(value);
+                if (val >= 0) return FormValidation.ok();
+            }
+            catch ( NumberFormatException nfe ) {}
+            return FormValidation.error("Idle Termination time must be a non-negative integer (or null)");
+        }
+
+        public FormValidation doCheckInstanceCapStr(@QueryParameter String value) {
+            if (value == null || value.trim() == "") return FormValidation.ok();
+            try {
+                int val = Integer.parseInt(value);
+                if (val >= 0) return FormValidation.ok();
+            } catch ( NumberFormatException nfe ) {}
+            return FormValidation.error("InstanceCap must be a non-negative integer (or null)");
+        }
         
-        public ListBoxModel doFillZoneItems(@QueryParameter String accessId,
-        		@QueryParameter String secretKey, @QueryParameter String region) throws IOException,
-    			ServletException {
-        	return EC2Slave.fillZoneItems(accessId, secretKey, region);
-    	}
-        
+        public ListBoxModel doFillZoneItems( @QueryParameter String accessId,
+                                             @QueryParameter String secretKey,
+                                             @QueryParameter String region)
+                                             throws IOException, ServletException
+        {
+            return EC2Slave.fillZoneItems(accessId, secretKey, region);
+        }
     }
 }
+

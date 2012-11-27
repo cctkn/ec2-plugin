@@ -1,20 +1,12 @@
 package hudson.plugins.ec2;
 
-import hudson.Extension;
 import hudson.Util;
-import hudson.model.Slave.SlaveDescriptor;
 import hudson.slaves.SlaveComputer;
-import hudson.util.ListBoxModel;
-
 import java.io.IOException;
 import java.util.Collections;
 
-import javax.servlet.ServletException;
-
 import org.kohsuke.stapler.HttpRedirect;
 import org.kohsuke.stapler.HttpResponse;
-import org.kohsuke.stapler.QueryParameter;
-
 import com.amazonaws.AmazonClientException;
 import com.amazonaws.services.ec2.AmazonEC2;
 import com.amazonaws.services.ec2.model.DescribeInstancesRequest;
@@ -111,7 +103,8 @@ public class EC2Computer extends SlaveComputer {
     @Override
     public HttpResponse doDoDelete() throws IOException {
         checkPermission(DELETE);
-        getNode().terminate();
+        if (getNode() != null)
+        	getNode().terminate();
         return new HttpRedirect("..");
     }
 
